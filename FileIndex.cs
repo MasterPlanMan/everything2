@@ -8,7 +8,7 @@ public sealed class FileIndex : IDisposable
     private readonly string[] roots;
     private readonly string cache;
     private readonly List<FileSystemWatcher> watchers = [];
-    private readonly ConcurrentQueue<(string Path, bool Remove)> changes = new();
+    private readonly ConcurrentQueue<(string Path, bool Remove, bool Walk)> changes = new();
     private readonly CancellationTokenSource stop = new();
     private Dictionary<string, Entry> items = new(StringComparer.OrdinalIgnoreCase);
     private Entry[] snapshot = [];
@@ -33,10 +33,11 @@ public sealed class FileIndex : IDisposable
             {
                 try
                 {
-                    var watcher = new FileSystemWatcher(root) { IncludeSubdirectories = true, NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName, InternalBufferSize = 65536 };
+                    var watcher = new FileSystemWatcher(root) { IncludeSubdirectories = true, NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.Size | NotifyFilters.LastWrite, InternalBufferSize = 65536 };
                     watcher.Created += (_, e) => Enqueue(e.FullPath, false);
                     watcher.Deleted += (_, e) => Enqueue(e.FullPath, true);
                     watcher.Renamed += (_, e) => { Enqueue(e.OldFullPath, true); Enqueue(e.FullPath, false); };
+                    watcher.Changed += (_, e) => Enqueue(e.FullPath, false, false);
                     watcher.Error += (_, _) => Rebuild();
                     watcher.EnableRaisingEvents = true;
                     watchers.Add(watcher);
@@ -60,10 +61,10 @@ public sealed class FileIndex : IDisposable
                     if (change.Remove) RemoveTree(change.Path);
                     else if (Directory.Exists(change.Path))
                     {
-                        items[change.Path] = new(change.Path, true);
-                        Walk(change.Path, items, false);
+                        if (ReadEntry(new DirectoryInfo(change.Path)) is { } directory) items[change.Path] = directory;
+                        if (change.Walk && CanWalk(change.Path)) Walk(change.Path, items, false);
                     }
-                    else if (File.Exists(change.Path)) items[change.Path] = new(change.Path, false);
+                    else if (File.Exists(change.Path) && ReadEntry(new FileInfo(change.Path)) is { } file) items[change.Path] = file;
                     updated = true;
                 }
                 if (updated) { dirty = true; Publish(); }
@@ -74,11 +75,25 @@ public sealed class FileIndex : IDisposable
         catch (OperationCanceledException) { }
         catch (Exception e) { Status = "Index stopped: " + e.Message; Updated?.Invoke(); }
     }
-    private void Enqueue(string path, bool remove)
+    private void Enqueue(string path, bool remove, bool walk = true)
     {
         if (Excluded(path)) return;
         if (changes.Count > 100000) { Rebuild(); return; }
-        changes.Enqueue((path, remove));
+        changes.Enqueue((path, remove, walk));
+    }
+    internal static Entry? ReadEntry(FileSystemInfo info)
+    {
+        try
+        {
+            var directory = (info.Attributes & FileAttributes.Directory) != 0;
+            return new(info.FullName, directory, info is FileInfo file ? file.Length : null, info.LastWriteTimeUtc);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException) { return null; }
+    }
+    private static bool CanWalk(string path)
+    {
+        try { return (File.GetAttributes(path) & FileAttributes.ReparsePoint) == 0; }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException) { return false; }
     }
     private void RemoveTree(string path)
     {
@@ -110,7 +125,7 @@ public sealed class FileIndex : IDisposable
                 {
                     if (Excluded(info.FullName)) continue;
                     var directory = (info.Attributes & FileAttributes.Directory) != 0;
-                    target[info.FullName] = new(info.FullName, directory);
+                    if (ReadEntry(info) is { } entry) target[info.FullName] = entry;
                     if (directory && (info.Attributes & FileAttributes.ReparsePoint) == 0) pending.Push(info.FullName);
                     if (progress && target.Count % 25000 == 0)
                     {
@@ -131,18 +146,19 @@ public sealed class FileIndex : IDisposable
             using var file = File.OpenRead(cache);
             using var zip = new GZipStream(file, CompressionMode.Decompress);
             using var reader = new BinaryReader(zip);
-            if (reader.ReadString() != "Everything2-v1") return;
+            if (reader.ReadString() != "Everything2-v2") return;
             var count = reader.ReadInt32();
             var loaded = new Dictionary<string, Entry>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < count; i++)
             {
                 var path = reader.ReadString(); var directory = reader.ReadBoolean();
-                if (roots.Any(r => path.StartsWith(r, StringComparison.OrdinalIgnoreCase))) loaded[path] = new(path, directory);
+                var size = reader.ReadInt64(); var ticks = reader.ReadInt64();
+                if (roots.Any(r => path.StartsWith(r, StringComparison.OrdinalIgnoreCase))) loaded[path] = new(path, directory, size < 0 ? null : size, ticks == 0 ? null : new DateTime(ticks, DateTimeKind.Utc));
             }
             items = loaded;
             Status = "Cached index loaded · checking for changes…";
         }
-        catch (Exception e) when (e is IOException or InvalidDataException or UnauthorizedAccessException or FormatException) { Status = "Building a fresh index…"; }
+        catch (Exception e) when (e is IOException or InvalidDataException or UnauthorizedAccessException or FormatException or ArgumentException) { Status = "Building a fresh index…"; }
     }
     private void Save()
     {
@@ -153,8 +169,8 @@ public sealed class FileIndex : IDisposable
             using (var zip = new GZipStream(file, CompressionLevel.Fastest))
             using (var writer = new BinaryWriter(zip))
             {
-                writer.Write("Everything2-v1"); writer.Write(items.Count);
-                foreach (var entry in items.Values) { writer.Write(entry.Path); writer.Write(entry.IsDirectory); }
+                writer.Write("Everything2-v2"); writer.Write(items.Count);
+                foreach (var entry in items.Values) { writer.Write(entry.Path); writer.Write(entry.IsDirectory); writer.Write(entry.Size ?? -1); writer.Write(entry.ModifiedUtc?.Ticks ?? 0); }
             }
             File.Move(cache + ".tmp", cache, true);
             dirty = false;
